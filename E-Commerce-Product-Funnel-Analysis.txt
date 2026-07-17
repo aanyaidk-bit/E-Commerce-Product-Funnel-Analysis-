@@ -1,0 +1,201 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import zipfile
+import gc
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+STYLE = {
+    "bg":      "#1D1D20",
+    "fg":      "#fbfbff",
+    "fg2":     "#909094",
+    "colors":  ["#A1C9F4", "#FFB482", "#8DE5A1", "#FF9F9B", "#D0BBFF", "#F7B6D2"],
+}
+
+# ── 1. Load with chunked reading ───────────────────────────────────────────────
+COLS = ["event_time", "event_type", "product_id", "category_code", "price", "user_id", "user_session"]
+DTYPES = {
+    "event_type": "category",
+    "product_id": "int32",
+    "category_code": "category",
+    "price": "float32",
+    "user_id": "int32",
+    "user_session": "category",
+}
+
+CHUNK = 2_000_000
+chunks = []
+with zipfile.ZipFile("archive.zip", "r") as z:
+    with z.open("2019-Oct.csv") as f:
+        for chunk in pd.read_csv(f, usecols=COLS, dtype=DTYPES, parse_dates=["event_time"], chunksize=CHUNK):
+            chunks.append(chunk)
+
+raw_df = pd.concat(chunks, ignore_index=True)
+del chunks
+gc.collect()
+
+# ── 2. Clean ───────────────────────────────────────────────────────────────────
+events_df = raw_df.dropna(subset=["user_session"]).copy()
+events_df["category_code"] = events_df["category_code"].fillna("unknown")
+# Top-level category (first segment of dot-separated code)
+events_df["category_l1"] = events_df["category_code"].astype(str).str.split(".").str[0].astype("category")
+events_df["hour"] = events_df["event_time"].dt.hour
+events_df["dow"]  = events_df["event_time"].dt.day_name()
+del raw_df
+gc.collect()
+
+print(f"Clean dataset: {events_df.shape[0]:,} rows")
+print("Event type counts:\n", events_df["event_type"].value_counts())
+print("\nTop 10 L1 categories:\n", events_df["category_l1"].value_counts().head(10))
+
+# ── 3. Funnel: unique users at each stage ──────────────────────────────────────
+funnel_stages = ["view", "cart", "purchase"]
+funnel_users = {s: events_df.loc[events_df["event_type"] == s, "user_id"].nunique() for s in funnel_stages}
+funnel_sessions = {s: events_df.loc[events_df["event_type"] == s, "user_session"].nunique() for s in funnel_stages}
+
+print("\n── Funnel (unique users) ──")
+for s in funnel_stages:
+    drop = "" if s == "view" else f"  (drop-off from view: {(1 - funnel_users[s]/funnel_users['view'])*100:.1f}%)"
+    print(f"  {s:10s}: {funnel_users[s]:>9,}{drop}")
+
+view_to_cart     = funnel_users["cart"]     / funnel_users["view"]
+cart_to_purchase = funnel_users["purchase"] / funnel_users["cart"]
+overall_cvr      = funnel_users["purchase"] / funnel_users["view"]
+print(f"\n  View→Cart CVR:     {view_to_cart*100:.2f}%")
+print(f"  Cart→Purchase CVR: {cart_to_purchase*100:.2f}%")
+print(f"  Overall CVR:       {overall_cvr*100:.2f}%")
+
+# ── 4. Category-level funnel ───────────────────────────────────────────────────
+def category_funnel(df, top_n=10):
+    rows = []
+    top_cats = df.loc[df["event_type"] == "view", "category_l1"].value_counts().head(top_n).index
+    for cat in top_cats:
+        sub = df[df["category_l1"] == cat]
+        v = sub.loc[sub["event_type"] == "view",     "user_id"].nunique()
+        c = sub.loc[sub["event_type"] == "cart",     "user_id"].nunique()
+        p = sub.loc[sub["event_type"] == "purchase", "user_id"].nunique()
+        rows.append({"category": cat, "views": v, "carts": c, "purchases": p,
+                     "view_to_cart_pct":     round(c/v*100, 2) if v else 0,
+                     "cart_to_purchase_pct": round(p/c*100, 2) if c else 0,
+                     "overall_cvr_pct":      round(p/v*100, 2) if v else 0})
+    return pd.DataFrame(rows).sort_values("views", ascending=False)
+
+category_funnel_df = category_funnel(events_df, top_n=10)
+print("\n── Category Funnel ──")
+print(category_funnel_df.to_string(index=False))
+
+# ── 5. Hourly conversion rate ──────────────────────────────────────────────────
+hourly_df = (
+    events_df.groupby(["hour", "event_type"])["user_id"]
+    .nunique()
+    .unstack(fill_value=0)
+    .rename(columns={"view": "views", "cart": "carts", "purchase": "purchases"})
+    .reset_index()
+)
+for col in ["carts", "purchases"]:
+    if col not in hourly_df.columns:
+        hourly_df[col] = 0
+hourly_df["cvr_pct"] = (hourly_df["purchases"] / hourly_df["views"].replace(0, np.nan) * 100).round(2)
+
+# ── 6. Day-of-week conversion rate ────────────────────────────────────────────
+DOW_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+dow_df = (
+    events_df.groupby(["dow", "event_type"])["user_id"]
+    .nunique()
+    .unstack(fill_value=0)
+    .rename(columns={"view": "views", "cart": "carts", "purchase": "purchases"})
+    .reindex(DOW_ORDER)
+    .reset_index()
+)
+for col in ["carts", "purchases"]:
+    if col not in dow_df.columns:
+        dow_df[col] = 0
+dow_df["cvr_pct"] = (dow_df["purchases"] / dow_df["views"].replace(0, np.nan) * 100).round(2)
+
+# ── 7. Visualisations ──────────────────────────────────────────────────────────
+plt.rcParams.update({
+    "figure.facecolor": STYLE["bg"], "axes.facecolor": STYLE["bg"],
+    "text.color": STYLE["fg"], "axes.labelcolor": STYLE["fg"],
+    "xtick.color": STYLE["fg"], "ytick.color": STYLE["fg"],
+    "axes.edgecolor": STYLE["fg2"], "grid.color": STYLE["fg2"],
+    "grid.alpha": 0.2, "font.size": 11,
+})
+
+# 7a. Overall funnel bar chart
+funnel_fig, ax = plt.subplots(figsize=(8, 5))
+funnel_fig.patch.set_facecolor(STYLE["bg"])
+_vals = [funnel_users[s] for s in funnel_stages]
+_bars = ax.bar(funnel_stages, _vals, color=STYLE["colors"][:3], width=0.5, zorder=2)
+ax.set_title("Overall Conversion Funnel (Unique Users)", color=STYLE["fg"], fontsize=14, pad=12)
+ax.set_ylabel("Unique Users", color=STYLE["fg"])
+ax.yaxis.grid(True, zorder=0)
+ax.set_axisbelow(True)
+for bar, val in zip(_bars, _vals):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() * 1.01,
+            f"{val:,.0f}", ha="center", va="bottom", color=STYLE["fg"], fontsize=10)
+_yticks = [int(v) for v in ax.get_yticks()]
+ax.set_yticks(_yticks)
+ax.set_yticklabels([f"{v/1e6:.1f}M" if v >= 1e6 else f"{v/1e3:.0f}K" if v >= 1e3 else str(v) for v in _yticks])
+plt.tight_layout()
+plt.show()
+
+# 7b. Category funnel – view-to-cart vs cart-to-purchase
+cat_fig, ax2 = plt.subplots(figsize=(10, 6))
+cat_fig.patch.set_facecolor(STYLE["bg"])
+_x = np.arange(len(category_funnel_df))
+_w = 0.35
+ax2.bar(_x - _w/2, category_funnel_df["view_to_cart_pct"],     _w, label="View→Cart %",     color=STYLE["colors"][0], zorder=2)
+ax2.bar(_x + _w/2, category_funnel_df["cart_to_purchase_pct"], _w, label="Cart→Purchase %", color=STYLE["colors"][1], zorder=2)
+ax2.set_xticks(_x)
+ax2.set_xticklabels(category_funnel_df["category"].astype(str), rotation=30, ha="right")
+ax2.set_title("Conversion Rates by Top Category", color=STYLE["fg"], fontsize=14, pad=12)
+ax2.set_ylabel("Conversion Rate (%)", color=STYLE["fg"])
+ax2.legend(facecolor=STYLE["bg"], edgecolor=STYLE["fg2"], labelcolor=STYLE["fg"])
+ax2.yaxis.grid(True, zorder=0)
+ax2.set_axisbelow(True)
+plt.tight_layout()
+plt.show()
+
+# 7c. Hourly CVR line chart
+hourly_fig, ax3 = plt.subplots(figsize=(10, 5))
+hourly_fig.patch.set_facecolor(STYLE["bg"])
+ax3.plot(hourly_df["hour"], hourly_df["cvr_pct"], color=STYLE["colors"][2], linewidth=2.5, marker="o", markersize=5)
+ax3.set_title("Purchase Conversion Rate by Hour of Day", color=STYLE["fg"], fontsize=14, pad=12)
+ax3.set_xlabel("Hour (UTC)", color=STYLE["fg"])
+ax3.set_ylabel("CVR (%)", color=STYLE["fg"])
+ax3.set_xticks(range(0, 24, 2))
+ax3.yaxis.grid(True, zorder=0)
+ax3.set_axisbelow(True)
+plt.tight_layout()
+plt.show()
+
+# 7d. Day-of-week CVR bar
+dow_fig, ax4 = plt.subplots(figsize=(9, 5))
+dow_fig.patch.set_facecolor(STYLE["bg"])
+_dow_bars = ax4.bar(dow_df["dow"], dow_df["cvr_pct"], color=STYLE["colors"][4], zorder=2)
+ax4.set_title("Purchase Conversion Rate by Day of Week", color=STYLE["fg"], fontsize=14, pad=12)
+ax4.set_ylabel("CVR (%)", color=STYLE["fg"])
+ax4.yaxis.grid(True, zorder=0)
+ax4.set_axisbelow(True)
+for bar, val in zip(_dow_bars, dow_df["cvr_pct"]):
+    ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.002,
+             f"{val:.2f}%", ha="center", va="bottom", fontsize=9, color=STYLE["fg"])
+plt.tight_layout()
+plt.show()
+
+print("\n✅ All charts rendered.")
+print(f"\n── Summary ──")
+print(f"  42.4M events | Oct 2019 | {events_df['user_id'].nunique():,} unique users")
+print(f"  View→Cart: {view_to_cart*100:.2f}%  |  Cart→Purchase: {cart_to_purchase*100:.2f}%  |  Overall CVR: {overall_cvr*100:.2f}%")
+
+# ── Export for Power BI ───────────────────────────────────────────────────────
+funnel_export = pd.DataFrame({
+    "stage": funnel_stages,
+    "unique_users": [funnel_users[s] for s in funnel_stages],
+    "conversion_from_view_pct": [round(funnel_users[s]/funnel_users["view"]*100, 2) for s in funnel_stages]
+})
+funnel_export.to_csv("powerbi_funnel.csv", index=False)
+category_funnel_df.to_csv("powerbi_category_funnel.csv", index=False)
+hourly_df.to_csv("powerbi_hourly.csv", index=False)
+dow_df.to_csv("powerbi_dow.csv", index=False)
+print("CSVs exported for Power BI ✅")
